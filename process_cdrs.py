@@ -5,14 +5,16 @@ import glob
 import shutil
 import time
 from datetime import datetime
+from ftplib import FTP
 import pytz.reference
 from thrift.transport import TTransport
 from thrift.protocol import TBinaryProtocol
 
 
+
 thrift_config = {
                 'sm7': [('/var/cdrs/env1/', '/var/data/cdrs/env1', 8), ('/var/cdrs/env3', '/var/data/cdrs/env3', 13)],
-                'sm8': [('','',9)],
+                'sm8': [('/var/writable/','/var/data/cdrs/env1',9)],
                 'sm9': [('/storage/cdrs/env1', '/var/data/cdrs/env1', 11)],
                 'sm10': [('/var/thrift-cdrs/', '/var/data/cdrs/env1', 12)]
                 }
@@ -49,7 +51,7 @@ valid_cdr_files['cdrs_connections-thrift'][1] = ['i_cdrs_connection','i_call','i
                                     'grace_period','user_agent','pdd100','pdd1xx','i_account_debug','i_protocol','release_source',
                                     'call_setup_time','lrn_cld','area_name','i_media_relay','remote_ip','vendor_name']
 
-valid_cdr_files['calls_sdp-thrift'][1] = ['i_calls_sdp','i_call','i_cdrs_connection','time_stamp','rtp_ip','codec','sip_msg_type']
+valid_cdr_files['calls_sdp-thrift'][1] = ['i_calls_sdp','i_call','i_cdrs_connection','time_stamp','sig_ip','rtp_ip','codec','sip_msg_type']
 
 codecs = {'0': 'PCMU', '3': 'GSM', '4': 'G723', '8': 'PCMA', '9': 'G722', '15': 'G728', '18': 'G729'}
 
@@ -95,11 +97,13 @@ def align_struct(obj, i_switch):
         st['area_name'] = obj.area_name.s if obj.area_name else None
         return st
     elif type(obj)==ttypes.CallsSdp:
-        st['i_call'] = '%d.%d' % (st['i_call'], i_switch)
-        st['i_calls_sdp'] = '%d.%d' % (st['i_calls_sdp'], i_switch)
-        st['i_cdrs_connection'] = '%d.%d' % (obj.i_cdrs_connection.v, i_switch) if obj.i_cdrs_connection!=None else '-1'
+        #st['i_call'] = '%d.%d' % (st['i_call'], i_switch)
+        #st['i_calls_sdp'] = '%d.%d' % (st['i_calls_sdp'], i_switch)
+        #st['i_cdrs_connection'] = '%d.%d' % (obj.i_cdrs_connection.v, i_switch) if obj.i_cdrs_connection!=None else '-1'
+        st['i_cdrs_connection'] = obj.i_cdrs_connection.v if obj.i_cdrs_connection!=None else '-1'
         st['time_stamp'] = datetime.fromtimestamp(obj.time_stamp.seconds, pytz.reference.UTC).strftime('%Y-%m-%d %H:%M:%S+00:00')
         lsdp = compile_sdp(obj.sdp)
+        st['sig_ip']=get_sigip(lsdp)
         st['rtp_ip']=get_rtpip(lsdp)
         st['codec']=get_codec(lsdp)
         return st
@@ -116,7 +120,7 @@ def compile_sdp(sdp):
     avp=[]
     s=0
     for v, param in avpairs:
-        if v.strip().lower() in ['c', 'm', 'a']:
+        if v.strip().lower() in ['c', 'm', 'a', 'o']:
             if v.strip().lower()=='m':
                 if s > 0:
                     break
@@ -125,6 +129,14 @@ def compile_sdp(sdp):
             avp.append([v.strip().lower(), param.strip()])
 
     return avp
+
+def get_sigip(avpairs):
+    for v, param in avpairs:
+        if v == 'o' and len(param.split())==6:
+            return param.split()[-1].strip()
+
+    return ''
+
 
 def get_rtpip(avpairs):
     for v, param in avpairs:
@@ -171,7 +183,7 @@ def pull_cdrs(switchname):
             pass
 
         bdb = get_bdb_connection(env[1])
-        for cdr_file in glob.glob(os.path.join(env[0],'*.bin.*')):
+        for cdr_file in glob.glob(os.path.join(env[0],'*sdp*.bin.*')):
             try:
                 filename = cdr_file.split('/')[-1]
                 tag = filename.split('.')[0]
@@ -193,10 +205,29 @@ def pull_cdrs(switchname):
         bdb.close()
 
 
+def upload_csv(switchname):
+    ftp = FTP('170.178.202.138')
+    ftp.login("bhaoo-cdrs", '{bits14Operator!New}')
+    ftp.cwd('sippy')
+    for csv_file in glob.glob('/var/data/cdrs/*sdp*.bin.*.csv'):
+        try:
+            file_dst = csv_file.split('/')[-1]
+            file = open(csv_file, 'rb')
+            ftp.storbinary('STOR ' + file_dst + '.tmp', file)
+            file.close()
+            ftp.rename(file_dst + '.tmp', file_dst)
+            os.remove(csv_file)
+        except:
+            print "Error while uploading files...\n"
+
+    ftp.quit()
+    return
+
+
 def make_csv(switchname):
     for env in thrift_config[switchname]:
         i_switch = env[2]
-        for cdr_file in glob.glob(os.path.join(env[1],'*.bin.*')):
+        for cdr_file in glob.glob(os.path.join(env[1],'*sdp*.bin.*')):
             try:
                 filename = cdr_file.split('/')[-1]
                 tag = filename.split('.')[0]
@@ -208,7 +239,7 @@ def make_csv(switchname):
                 continue
 
             print cdr_file
-            csv_name = '%s.csv' % filename 
+            csv_name = '%s_%d_%s.csv' % (switchname, i_switch, filename)
             csvfile = open(os.path.join('/var/data/cdrs', csv_name), "wb")
             wr = csv.DictWriter(csvfile, delimiter='`', escapechar='\\', lineterminator='\n', quoting=csv.QUOTE_NONE, fieldnames=valid_cdr_files[tag][1], extrasaction='ignore')
 
@@ -224,7 +255,7 @@ def make_csv(switchname):
                     break
 
             csvfile.close()
-
+            os.remove(cdr_file)
 
 if __name__ == "__main__":
     try:
@@ -241,4 +272,5 @@ if __name__ == "__main__":
 
     pull_cdrs(switchname)
     make_csv(switchname)
+    upload_csv(switchname)
 

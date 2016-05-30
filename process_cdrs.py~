@@ -5,16 +5,17 @@ import glob
 import shutil
 import time
 from datetime import datetime
+from ftplib import FTP
 import pytz.reference
 from thrift.transport import TTransport
 from thrift.protocol import TBinaryProtocol
 
 
 thrift_config = {
-                'sm7': [('/var/cdrs/env1/', '/var/data/cdrs/env1'), ('/var/cdrs/env3', '/var/data/cdrs/env3')],
-                'sm8': [],
-                'sm9': [('/storage/cdrs/env1', '/var/data/cdrs/env1')],
-                'sm10': [('/var/thrift-cdrs/', '/var/data/cdrs/env1')]
+                'sm7': [('/var/cdrs/env1/', '/var/data/cdrs/env1', 8), ('/var/cdrs/env3', '/var/data/cdrs/env3', 13)],
+                'sm8': [('/var/writable/','/var/data/cdrs/env1',9)],
+                'sm9': [('/storage/cdrs/env1', '/var/data/cdrs/env1', 11)],
+                'sm10': [('/var/thrift-cdrs/', '/var/data/cdrs/env1', 12)]
                 }
 
 
@@ -49,20 +50,23 @@ valid_cdr_files['cdrs_connections-thrift'][1] = ['i_cdrs_connection','i_call','i
                                     'grace_period','user_agent','pdd100','pdd1xx','i_account_debug','i_protocol','release_source',
                                     'call_setup_time','lrn_cld','area_name','i_media_relay','remote_ip','vendor_name']
 
-valid_cdr_files['calls_sdp-thrift'][1] = ['i_calls_sdp','i_call','i_cdrs_connection','time_stamp','rtp_ip','codec','sip_msg_type']
+valid_cdr_files['calls_sdp-thrift'][1] = ['i_calls_sdp','i_call','i_cdrs_connection','time_stamp','sig_ip','rtp_ip','codec','sip_msg_type']
 
 codecs = {'0': 'PCMU', '3': 'GSM', '4': 'G723', '8': 'PCMA', '9': 'G722', '15': 'G728', '18': 'G729'}
 
 
 
-def align_struct(obj):
+def align_struct(obj, i_switch):
     st = dict(obj.__dict__)
     if type(obj)==ttypes.Calls:
+        st['i_call'] = '%d.%d' % (st['i_call'], i_switch)
         st['setup_time'] = datetime.fromtimestamp(obj.setup_time, pytz.reference.UTC).strftime('%Y-%m-%d %H:%M:%S+00:00')
         st['parent_i_call'] = obj.parent_i_call.v if obj.parent_i_call else None
         st['i_call_type'] = obj.i_call_type.v if obj.i_call_type else None
         return st
     elif type(obj)==ttypes.Cdrs:
+        st['i_call'] = '%d.%d' % (st['i_call'], i_switch)
+        st['i_cdr'] = '%d.%d' % (st['i_cdr'], i_switch)
         st['lrn_cld'] = obj.lrn_cld.s if obj.lrn_cld else None
         st['lrn_cld_in'] = obj.lrn_cld_in.s if obj.lrn_cld_in else None
         st['area_name'] = obj.area_name.s if obj.area_name else None
@@ -72,6 +76,8 @@ def align_struct(obj):
         st['disconnect_time'] = datetime.fromtimestamp(obj.disconnect_time, pytz.reference.UTC).strftime('%Y-%m-%d %H:%M:%S+00:00')
         return st
     elif type(obj)==ttypes.CdrsConnections:
+        st['i_call'] = '%d.%d' % (st['i_call'], i_switch)
+        st['i_cdrs_connection'] = '%d.%d' % (st['i_cdrs_connection'], i_switch)
         st['setup_time'] = datetime.fromtimestamp(obj.setup_time, pytz.reference.UTC).strftime('%Y-%m-%d %H:%M:%S+00:00')
         st['connect_time'] = datetime.fromtimestamp(obj.connect_time, pytz.reference.UTC).strftime('%Y-%m-%d %H:%M:%S+00:00')
         st['disconnect_time'] = datetime.fromtimestamp(obj.disconnect_time, pytz.reference.UTC).strftime('%Y-%m-%d %H:%M:%S+00:00')
@@ -83,13 +89,20 @@ def align_struct(obj):
         st['vendor_name'] = obj.vendor_name.s if obj.vendor_name else None
         return st
     elif type(obj)==ttypes.CdrsCustomers:
+        st['i_call'] = '%d.%d' % (st['i_call'], i_switch)
+        st['i_cdrs_customer'] = '%d.%d' % (st['i_cdrs_customer'], i_switch)
+        st['i_cdr'] = '%d.%d' % (st['i_cdr'], i_switch)
         st['setup_time'] = datetime.fromtimestamp(obj.setup_time, pytz.reference.UTC).strftime('%Y-%m-%d %H:%M:%S+00:00')
         st['area_name'] = obj.area_name.s if obj.area_name else None
         return st
     elif type(obj)==ttypes.CallsSdp:
+        #st['i_call'] = '%d.%d' % (st['i_call'], i_switch)
+        #st['i_calls_sdp'] = '%d.%d' % (st['i_calls_sdp'], i_switch)
+        #st['i_cdrs_connection'] = '%d.%d' % (obj.i_cdrs_connection.v, i_switch) if obj.i_cdrs_connection!=None else '-1'
         st['i_cdrs_connection'] = obj.i_cdrs_connection.v if obj.i_cdrs_connection!=None else '-1'
         st['time_stamp'] = datetime.fromtimestamp(obj.time_stamp.seconds, pytz.reference.UTC).strftime('%Y-%m-%d %H:%M:%S+00:00')
         lsdp = compile_sdp(obj.sdp)
+        st['sig_ip']=get_sigip(lsdp)
         st['rtp_ip']=get_rtpip(lsdp)
         st['codec']=get_codec(lsdp)
         return st
@@ -106,7 +119,7 @@ def compile_sdp(sdp):
     avp=[]
     s=0
     for v, param in avpairs:
-        if v.strip().lower() in ['c', 'm', 'a']:
+        if v.strip().lower() in ['c', 'm', 'a', 'o']:
             if v.strip().lower()=='m':
                 if s > 0:
                     break
@@ -115,6 +128,14 @@ def compile_sdp(sdp):
             avp.append([v.strip().lower(), param.strip()])
 
     return avp
+
+def get_sigip(avpairs):
+    for v, param in avpairs:
+        if v == 'o' and len(param.split())==6:
+            return param.split()[-1].strip()
+
+    return ''
+
 
 def get_rtpip(avpairs):
     for v, param in avpairs:
@@ -161,7 +182,7 @@ def pull_cdrs(switchname):
             pass
 
         bdb = get_bdb_connection(env[1])
-        for cdr_file in glob.glob(os.path.join(env[0],'*.bin.*')):
+        for cdr_file in glob.glob(os.path.join(env[0],'*sdp*.bin.*')):
             try:
                 filename = cdr_file.split('/')[-1]
                 tag = filename.split('.')[0]
@@ -183,9 +204,13 @@ def pull_cdrs(switchname):
         bdb.close()
 
 
+def upload_csv(switchname):
+    for cdr_file in glob.glob('/var/data/cdrs/*sdp*.bin.csv'):
+
 def make_csv(switchname):
     for env in thrift_config[switchname]:
-        for cdr_file in glob.glob(os.path.join(env[1],'*.bin.*')):
+        i_switch = env[2]
+        for cdr_file in glob.glob(os.path.join(env[1],'*sdp*.bin.*')):
             try:
                 filename = cdr_file.split('/')[-1]
                 tag = filename.split('.')[0]
@@ -197,7 +222,7 @@ def make_csv(switchname):
                 continue
 
             print cdr_file
-            csv_name = '%s.csv' % filename 
+            csv_name = '%s_%s.csv' % (switchname, filename)
             csvfile = open(os.path.join('/var/data/cdrs', csv_name), "wb")
             wr = csv.DictWriter(csvfile, delimiter='`', escapechar='\\', lineterminator='\n', quoting=csv.QUOTE_NONE, fieldnames=valid_cdr_files[tag][1], extrasaction='ignore')
 
@@ -208,12 +233,12 @@ def make_csv(switchname):
                 obj = valid_cdr_files[tag][0]()
                 try:
                     obj.read(p)
-                    wr.writerow(align_struct(obj))
+                    wr.writerow(align_struct(obj, i_switch))
                 except EOFError:
                     break
 
             csvfile.close()
-
+            os.remove(cdr_file)
 
 if __name__ == "__main__":
     try:
@@ -230,4 +255,5 @@ if __name__ == "__main__":
 
     pull_cdrs(switchname)
     make_csv(switchname)
+    upload_csv(switchname)
 
